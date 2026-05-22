@@ -10,7 +10,7 @@ st.set_page_config(page_title="Rastreio de Pedidos", layout="wide")
 
 # Para conectar ao Turso real, instale: pip install libsql-client
 # E substitua a conexão abaixo pela URL do seu banco Turso.
-# Ex: conn = libsql_client.create_client_sync(url="sua-url-turso", auth_token="seu-token")
+# Ex: conn = libsql_client.create_client_sync(url="libsql://controlepedido-vitorrastrep.aws-us-east-2.turso.io", auth_token="eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3Nzk0NTYzMjksImlkIjoiMDE5ZTRmZDItMDAwMS03NDAzLWIzNzctYzE3NzExNTNkMDg4IiwicmlkIjoiYTIyZDdhOTUtYTE3My00MGE5LWE4NzItNzI1NmExM2U2OTdjIn0.p-XVNA5MQkdU_b5-lMWbwr23BAaeFKO9geGozBgV7xhBBnhIDUXz3grL7JI6NbUqsnE4xxLwCZvHeEKJjsroCg")
 def get_connection():
     return sqlite3.connect("pedidos.db", check_same_thread=False)
 
