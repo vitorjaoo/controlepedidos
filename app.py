@@ -1,139 +1,197 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
-from datetime import datetime
 import os
-
-# Cria uma pasta para salvar os PDFs localmente (para teste)
-if not os.path.exists("uploads"):
-    os.makedirs("uploads")
-
-st.set_page_config(page_title="Sistema de Pedidos", layout="wide")
+from datetime import datetime
 
 # ==========================================
-# 1. BANCO DE DADOS ATUALIZADO
+# CONFIGURAÇÃO DE AMBIENTE
+# ==========================================
+st.set_page_config(page_title="ERP | Rastreio de Pedidos", layout="wide", initial_sidebar_state="collapsed")
+
+# Diretório para simular armazenamento (Substituir por S3/Supabase Storage no deploy final)
+UPLOAD_DIR = "storage_pedidos"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# ==========================================
+# BANCO DE DADOS (TURSO / SQLITE)
 # ==========================================
 def get_connection():
-    return sqlite3.connect("pedidos.db", check_same_thread=False)
+    return sqlite3.connect("sistema_pedidos.db", check_same_thread=False)
 
 def init_db():
     conn = get_connection()
-    # Adicionadas colunas para arquivos PDF
     conn.execute('''CREATE TABLE IF NOT EXISTS pedidos (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    cliente TEXT, 
-                    status TEXT DEFAULT '1. Solicitação', 
-                    valor_fabrica REAL DEFAULT 0.0, 
-                    valor_mercos REAL DEFAULT 0.0, 
-                    valor_faturado REAL DEFAULT 0.0, 
-                    arquivo_pdf TEXT,
-                    data_atualizacao TEXT)''')
+                    cliente TEXT NOT NULL,
+                    etapa_atual TEXT DEFAULT '1. Solicitação',
+                    
+                    arq_solicitacao TEXT,
+                    
+                    valor_fabrica REAL DEFAULT 0.0,
+                    arq_orc_fabrica TEXT,
+                    
+                    valor_mercos REAL DEFAULT 0.0,
+                    
+                    confirmacao_cliente BOOLEAN DEFAULT 0,
+                    
+                    conferencia_fabrica BOOLEAN DEFAULT 0,
+                    
+                    valor_faturado REAL DEFAULT 0.0,
+                    arq_faturamento TEXT,
+                    
+                    data_atualizacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
     conn.commit()
 
 init_db()
 
 # ==========================================
-# 2. LOGIN (MANTIDO)
+# FUNÇÕES AUXILIARES
 # ==========================================
-if "role" not in st.session_state:
-    st.session_state.role = "admin" # Deixei admin por padrão para facilitar seu teste agora
+def salvar_arquivo(arquivo_upload, prefixo, pedido_id):
+    if arquivo_upload is not None:
+        nome_arquivo = f"{prefixo}_P{pedido_id}_{arquivo_upload.name}"
+        caminho = os.path.join(UPLOAD_DIR, nome_arquivo)
+        with open(caminho, "wb") as f:
+            f.write(arquivo_upload.getbuffer())
+        return nome_arquivo
+    return None
 
-# ==========================================
-# 3. INTERFACE COM ABAS
-# ==========================================
-col_title, col_logout = st.columns([8, 1])
-col_title.title("📦 Sistema Central de Pedidos")
-if col_logout.button("Sair"):
-    st.session_state.role = None
-    st.rerun()
-
-# Criando Abas para organizar o sistema em 1 só lugar
-aba_pedidos, aba_clientes = st.tabs(["🚀 Painel de Pedidos", "👥 Base de Clientes"])
-
-# ------------------------------------------
-# ABA 1: PAINEL DE PEDIDOS (Onde a mágica acontece)
-# ------------------------------------------
-with aba_pedidos:
+def atualizar_campo_pedido(pedido_id, campo, valor):
     conn = get_connection()
-    df = pd.read_sql_query("SELECT * FROM pedidos", conn)
+    conn.execute(f"UPDATE pedidos SET {campo} = ?, data_atualizacao = CURRENT_TIMESTAMP WHERE id = ?", (valor, pedido_id))
+    conn.commit()
 
-    if not df.empty:
-        df['saldo_faltante'] = df['valor_mercos'] - df['valor_faturado']
-        df['alerta_saldo'] = df['saldo_faltante'].apply(lambda x: "⚠️ FALTA SALDO" if x > 0 else "OK")
+# ==========================================
+# INTERFACE PRINCIPAL
+# ==========================================
+st.title("📦 Central de Rastreio e Faturamento")
 
-    col_grid, col_side = st.columns([7, 3])
+conn = get_connection()
+df = pd.read_sql_query("SELECT * FROM pedidos", conn)
 
-    with col_grid:
-        st.subheader("Visão Geral")
-        event = st.dataframe(df, use_container_width=True, hide_index=True, selection_mode="single-row", on_select="rerun")
+# ==========================================
+# CÁLCULOS EM TEMPO REAL (SALDO)
+# ==========================================
+if not df.empty:
+    df['saldo_faltante'] = df['valor_mercos'] - df['valor_faturado']
+    # Cria uma coluna visual rápida
+    df['status_saldo'] = df.apply(lambda row: "🔴 FALTA SALDO" if row['saldo_faltante'] > 0 and row['etapa_atual'] == '6. Faturamento' else "🟢 OK", axis=1)
 
-    with col_side:
-        st.subheader("Painel Rápido")
-        
-        # Se selecionou um pedido na tabela
-        if len(event.selection.rows) > 0:
-            linha = event.selection.rows[0]
-            p_id = df.iloc[linha]['id']
-            p_status = df.iloc[linha]['status']
-            p_arquivo = df.iloc[linha]['arquivo_pdf']
-            
-            st.write(f"**Pedido #{p_id}** | Cliente: {df.iloc[linha]['cliente']}")
-            
-            with st.form("form_edicao"):
-                lista_status = ['1. Solicitação', '2. Orçamento Fábrica', '3. Orçamento Mercos', '4. Confirmação Cliente', '5. Conferência', '6. Faturamento']
-                novo_status = st.selectbox("Status Atual", lista_status, index=lista_status.index(p_status) if p_status in lista_status else 0)
-                
-                col1, col2 = st.columns(2)
-                v_fab = col1.number_input("Fábrica (R$)", value=float(df.iloc[linha]['valor_fabrica']))
-                v_mer = col2.number_input("Mercos (R$)", value=float(df.iloc[linha]['valor_mercos']))
-                v_fat = st.number_input("Faturado (R$)", value=float(df.iloc[linha]['valor_faturado']))
-                
-                # UPLOAD DE PDF AQUI
-                st.markdown("---")
-                st.write("📄 **Anexos do Pedido**")
-                if pd.notna(p_arquivo) and p_arquivo != "":
-                    st.success(f"Arquivo anexado: {p_arquivo}")
-                
-                novo_pdf = st.file_uploader("Subir Orçamento (PDF)", type=["pdf"])
+# Layout Split: Grid (70%) e Cards de Ação (30%)
+col_grid, col_cards = st.columns([7, 4])
 
-                if st.form_submit_button("💾 Salvar Alterações"):
-                    nome_arquivo_salvo = p_arquivo
-                    
-                    # Se o usuário subiu um arquivo novo, salva na pasta uploads
-                    if novo_pdf is not None:
-                        nome_arquivo_salvo = f"pedido_{p_id}_{novo_pdf.name}"
-                        with open(os.path.join("uploads", nome_arquivo_salvo), "wb") as f:
-                            f.write(novo_pdf.getbuffer())
-
-                    conn.execute('''UPDATE pedidos SET 
-                                    status=?, valor_fabrica=?, valor_mercos=?, valor_faturado=?, arquivo_pdf=?, data_atualizacao=? 
-                                    WHERE id=?''', 
-                                 (novo_status, v_fab, v_mer, v_fat, nome_arquivo_salvo, datetime.now().strftime("%d/%m/%Y %H:%M"), p_id))
-                    conn.commit()
-                    st.rerun()
-        else:
-            st.info("👈 Clique em um pedido para ver e anexar PDFs.")
-
-        # Novo Pedido
-        st.divider()
-        with st.expander("➕ Iniciar Novo Pedido"):
-            with st.form("form_novo"):
-                novo_cliente = st.text_input("Nome/Código do Cliente")
-                if st.form_submit_button("Criar Pedido"):
+with col_grid:
+    st.subheader("Painel de Pedidos")
+    
+    with st.popover("➕ Novo Pedido"):
+        with st.form("form_novo_pedido"):
+            novo_cliente = st.text_input("Nome/Razão Social do Cliente")
+            if st.form_submit_button("Gerar Pedido"):
+                if novo_cliente:
                     conn.execute("INSERT INTO pedidos (cliente) VALUES (?)", (novo_cliente,))
                     conn.commit()
                     st.rerun()
 
-# ------------------------------------------
-# ABA 2: BASE DE CLIENTES (O "resto do sistema")
-# ------------------------------------------
-with aba_clientes:
-    st.subheader("Gestão de Clientes")
-    st.write("Para não poluir a tela de rastreio, cadastros fixos ficam aqui.")
-    st.info("Aqui você pode criar uma nova tabela no banco de dados chamada 'clientes' (com CNPJ, Endereço, Telefone, etc) e listar eles nesta aba. Depois, no 'Novo Pedido', em vez de digitar o nome, você fará um select puxando desta lista.")
+    # Exibição enxuta na tabela principal
+    colunas_visiveis = ['id', 'cliente', 'etapa_atual', 'valor_mercos', 'valor_faturado', 'saldo_faltante', 'status_saldo']
+    df_display = df[colunas_visiveis] if not df.empty else df
     
-    # Exemplo visual de como ficaria:
-    with st.expander("Cadastrar Novo Cliente"):
-        st.text_input("Razão Social")
-        st.text_input("CNPJ")
-        st.button("Salvar Cliente")
+    evento = st.dataframe(
+        df_display, 
+        use_container_width=True, 
+        hide_index=True,
+        selection_mode="single-row",
+        on_select="rerun"
+    )
+
+with col_cards:
+    st.subheader("Processo do Pedido")
+    
+    if len(evento.selection.rows) > 0:
+        linha_selecionada = evento.selection.rows[0]
+        pedido = df.iloc[linha_selecionada]
+        p_id = pedido['id']
+        
+        st.info(f"**Editando Pedido #{p_id}** | {pedido['cliente']}")
+        
+        # CARD 1: SOLICITAÇÃO
+        with st.expander("📝 1. Solicitação do Cliente", expanded=(pedido['etapa_atual'] == '1. Solicitação')):
+            if pedido['arq_solicitacao']:
+                st.success(f"Arquivo anexado: {pedido['arq_solicitacao']}")
+            else:
+                arq = st.file_uploader("Upload Solicitação (PDF/Img)", key=f"sol_{p_id}")
+                if st.button("Salvar Solicitação", key=f"btn_sol_{p_id}"):
+                    if arq:
+                        nome_salvo = salvar_arquivo(arq, "SOL", p_id)
+                        atualizar_campo_pedido(p_id, 'arq_solicitacao', nome_salvo)
+                        atualizar_campo_pedido(p_id, 'etapa_atual', '2. Orçamento Fábrica')
+                        st.rerun()
+
+        # CARD 2: ORÇAMENTO FÁBRICA
+        with st.expander("🏭 2. Orçamento Fábrica", expanded=(pedido['etapa_atual'] == '2. Orçamento Fábrica')):
+            v_fabrica = st.number_input("Custo Fábrica (R$)", value=float(pedido['valor_fabrica']), key=f"fab_v_{p_id}")
+            if pedido['arq_orc_fabrica']:
+                st.success(f"Arquivo anexado: {pedido['arq_orc_fabrica']}")
+            arq_fab = st.file_uploader("Upload Orçamento Fábrica", key=f"fab_a_{p_id}")
+            
+            if st.button("Avançar para Mercos", key=f"btn_fab_{p_id}"):
+                if arq_fab:
+                    nome_salvo = salvar_arquivo(arq_fab, "FAB", p_id)
+                    atualizar_campo_pedido(p_id, 'arq_orc_fabrica', nome_salvo)
+                atualizar_campo_pedido(p_id, 'valor_fabrica', v_fabrica)
+                atualizar_campo_pedido(p_id, 'etapa_atual', '3. Orçamento Mercos')
+                st.rerun()
+
+        # CARD 3: ORÇAMENTO MERCOS
+        with st.expander("💻 3. Orçamento Mercos", expanded=(pedido['etapa_atual'] == '3. Orçamento Mercos')):
+            v_mercos = st.number_input("Valor de Venda Mercos (R$)", value=float(pedido['valor_mercos']), key=f"mer_v_{p_id}")
+            if st.button("Aguardar Aprovação Cliente", key=f"btn_mer_{p_id}"):
+                atualizar_campo_pedido(p_id, 'valor_mercos', v_mercos)
+                atualizar_campo_pedido(p_id, 'etapa_atual', '4. Confirmação Cliente')
+                st.rerun()
+
+        # CARD 4: CONFIRMAÇÃO CLIENTE
+        with st.expander("✅ 4. Confirmação do Cliente", expanded=(pedido['etapa_atual'] == '4. Confirmação Cliente')):
+            conf_cliente = st.checkbox("Cliente deu o 'De Acordo'?", value=bool(pedido['confirmacao_cliente']), key=f"conf_c_{p_id}")
+            if st.button("Salvar Confirmação", key=f"btn_conf_c_{p_id}"):
+                atualizar_campo_pedido(p_id, 'confirmacao_cliente', conf_cliente)
+                if conf_cliente:
+                    atualizar_campo_pedido(p_id, 'etapa_atual', '5. Conferência Fábrica')
+                st.rerun()
+
+        # CARD 5: CONFERÊNCIA FÁBRICA
+        with st.expander("🔍 5. Versão Final Enviada (Conferência)", expanded=(pedido['etapa_atual'] == '5. Conferência Fábrica')):
+            conf_fab = st.checkbox("Versão final conferida e enviada para produção?", value=bool(pedido['conferencia_fabrica']), key=f"conf_f_{p_id}")
+            if st.button("Liberar para Faturamento", key=f"btn_conf_f_{p_id}"):
+                atualizar_campo_pedido(p_id, 'conferencia_fabrica', conf_fab)
+                if conf_fab:
+                    atualizar_campo_pedido(p_id, 'etapa_atual', '6. Faturamento')
+                st.rerun()
+
+        # CARD 6: FATURAMENTO
+        with st.expander("🧾 6. Faturamento e NFs", expanded=(pedido['etapa_atual'] == '6. Faturamento')):
+            v_faturado = st.number_input("Valor Faturado (R$)", value=float(pedido['valor_faturado']), key=f"fat_v_{p_id}")
+            if pedido['arq_faturamento']:
+                st.success(f"Arquivo anexado: {pedido['arq_faturamento']}")
+            arq_fat = st.file_uploader("Upload da NF / Faturamento", key=f"fat_a_{p_id}")
+            
+            if st.button("Atualizar Faturamento", key=f"btn_fat_{p_id}"):
+                if arq_fat:
+                    nome_salvo = salvar_arquivo(arq_fat, "FAT", p_id)
+                    atualizar_campo_pedido(p_id, 'arq_faturamento', nome_salvo)
+                atualizar_campo_pedido(p_id, 'valor_faturado', v_faturado)
+                st.rerun()
+
+        # CARD EXTRA: RASTREIO DE SALDO FALTANTE
+        st.markdown("---")
+        saldo = pedido['saldo_faltante']
+        if saldo > 0:
+            st.error(f"⚠️ **RASTREIO DE SALDO FALTANTE:** R$ {saldo:,.2f}")
+            st.caption("Atenção: O valor faturado está menor que o orçamento fechado no Mercos.")
+        else:
+            if pedido['valor_mercos'] > 0:
+                st.success("✔️ Faturamento completo. Sem saldo faltante.")
+
+    else:
+        st.write("👈 Selecione um pedido na tabela para abrir as etapas de processo.")
